@@ -27,7 +27,7 @@
       // --- Mode B: uji semua sensor, tampilkan payload JSON ---
       // sensorRain.begin(); sensorLidar.begin(); sensorAHT20.begin();
       // sensorWind.begin(); sensorFloat.begin(); sensorGPS.begin();
-      // sensorBaterai.begin();
+      // sensorBaterai.begin(); -> sekarang sensorINA226.begin();
       // testAllSensors();   // panggil sekali, atau taruh di loop() dgn interval
     }
 
@@ -57,7 +57,8 @@
 #include "SensorWind.h"
 #include "SensorFloatSwitch.h"
 #include "SensorGPS.h"
-#include "SensorAnalog.h"
+#include "SensorINA226.h"
+#include "FuzzyFloodStatus.h"
 
 // ------------------------------------------------------------
 // Objek sensor dipakai dari luar (dideklarasikan di RiverMonitor.ino).
@@ -69,7 +70,7 @@ extern SensorAHT20       sensorAHT20;
 extern SensorWind        sensorWind;
 extern SensorFloatSwitch sensorFloat;
 extern SensorGPS         sensorGPS;
-extern SensorAnalog      sensorBaterai;
+extern SensorINA226      sensorINA226;
 
 // ------------------------------------------------------------
 // Helper internal: pastikan sensor yang mau diuji sudah di-begin().
@@ -134,9 +135,11 @@ inline void testSensor(String nama)
     Serial.printf("  Jarak         : %u cm\n", sensorLidar.getDistanceCM());
     Serial.printf("  Kekuatan sinyal: %u\n", sensorLidar.getStrength());
     Serial.printf("  Suhu internal : %.2f C\n", sensorLidar.getTemperatureC());
-    float tma = TFLUNA_TINGGI_PEMASANGAN_CM - sensorLidar.getDistanceCM();
-    Serial.printf("  Estimasi TMA  : %.1f cm (tinggi pemasangan %.1f cm)\n",
-                  tma, TFLUNA_TINGGI_PEMASANGAN_CM);
+    float tmaCm = TFLUNA_TINGGI_PEMASANGAN_CM - sensorLidar.getDistanceCM();
+    float freeboard = (JARAK_SENSOR_KE_TEBING_KRITIS_CM - sensorLidar.getDistanceCM()) / 100.0f;
+    Serial.printf("  TMA (legacy)  : %.1f cm (tinggi pemasangan %.1f cm)\n", tmaCm, TFLUNA_TINGGI_PEMASANGAN_CM);
+    Serial.printf("  Freeboard     : %.2f m (jarak sensor-tebing kritis %.1f cm)\n",
+                  freeboard, JARAK_SENSOR_KE_TEBING_KRITIS_CM);
   }
   else if (nama == "aht20")
   {
@@ -180,10 +183,11 @@ inline void testSensor(String nama)
   }
   else if (nama == "bat" || nama == "baterai" || nama == "battery")
   {
-    if (!sudahBegin) { sensorBaterai.begin(); sudahBegin = true; }
-    Serial.println("---- [TEST] Tegangan Baterai ----");
-    Serial.printf("  Healthy       : %s\n", sensorBaterai.isHealthy() ? "YA" : "TIDAK");
-    Serial.printf("  Tegangan      : %.2f V\n", sensorBaterai.read());
+    if (!sudahBegin) { sensorINA226.begin(); sudahBegin = true; }
+    sensorINA226.update();
+    Serial.println("---- [TEST] Tegangan Baterai (INA226) ----");
+    Serial.printf("  Healthy       : %s\n", sensorINA226.isHealthy() ? "YA" : "TIDAK");
+    Serial.printf("  Tegangan      : %.2f V\n", sensorINA226.getBusVoltageV());
   }
   else
   {
@@ -232,7 +236,8 @@ inline void testAllSensors()
 
   if (sensorLidar.isHealthy())
   {
-    data.tma_cm = TFLUNA_TINGGI_PEMASANGAN_CM - sensorLidar.getDistanceCM();
+    data.tma_cm      = TFLUNA_TINGGI_PEMASANGAN_CM - sensorLidar.getDistanceCM();
+    data.freeboard_m = (JARAK_SENSOR_KE_TEBING_KRITIS_CM - sensorLidar.getDistanceCM()) / 100.0f;
   }
 
   data.angin_kmph           = sensorWind.getSpeedKMH();
@@ -240,7 +245,20 @@ inline void testAllSensors()
   data.hujan_intensitas_mmh = sensorRain.getIntensityMMh();
   data.hujan_kategori       = sensorRain.getCategory();
   data.levelKritis          = sensorFloat.isWaterHigh();
-  data.baterai_v            = sensorBaterai.read();
+  if (sensorINA226.isHealthy())
+  {
+    data.baterai_v = sensorINA226.getBusVoltageV();
+  }
+
+  // Hitung status fuzzy juga di mode test - supaya bisa langsung dilihat
+  // hasil akhirnya tanpa perlu WiFi/MQTT jalan (lihat FuzzyFloodStatus.h).
+  FuzzyFloodStatus fuzzyFlood;
+  if (sensorLidar.isHealthy())
+  {
+    float skor = fuzzyFlood.hitungSkor(data.freeboard_m, data.hujan_intensitas_mmh);
+    data.statusSkor  = skor;
+    data.statusLabel = FuzzyFloodStatus::labelKeString(FuzzyFloodStatus::skorKeLabel(skor));
+  }
 
   data.gpsFix = sensorGPS.hasFix();
   if (data.gpsFix)
@@ -255,9 +273,9 @@ inline void testAllSensors()
                 sensorRain.isHealthy() ? "OK" : "ERROR",
                 sensorRain.getIntensityMMh(), sensorRain.getCategory().c_str(),
                 sensorRain.getTotalMM());
-  Serial.printf("TF-Luna     : %s | jarak=%u cm, tma=%.1f cm, sinyal=%u\n",
+  Serial.printf("TF-Luna     : %s | jarak=%u cm, tma=%.1f cm, freeboard=%.2f m, sinyal=%u\n",
                 sensorLidar.isHealthy() ? "OK" : "ERROR",
-                sensorLidar.getDistanceCM(), data.tma_cm, sensorLidar.getStrength());
+                sensorLidar.getDistanceCM(), data.tma_cm, data.freeboard_m, sensorLidar.getStrength());
   Serial.printf("AHT20       : %s | %.2f C, %.2f %%RH\n",
                 sensorAHT20.isHealthy() ? "OK" : "ERROR",
                 sensorAHT20.getTemperatureC(), sensorAHT20.getHumidityRH());
@@ -272,6 +290,7 @@ inline void testAllSensors()
                 sensorGPS.hasFix() ? "ya" : "belum",
                 (unsigned long)sensorGPS.getSatellites());
   Serial.printf("Baterai     : %.2f V\n", data.baterai_v);
+  Serial.printf("Status Fuzzy: %s (skor=%.1f)\n", data.statusLabel.c_str(), data.statusSkor);
 
   // --- 2. Payload JSON yang AKAN dikirim ke MQTT (tapi tidak dikirim) ---
   String payload = buatJSON(data);

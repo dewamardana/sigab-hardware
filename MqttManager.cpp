@@ -10,9 +10,11 @@ void MqttManager::begin()
 
 void MqttManager::tryConnect()
 {
-  logInfo("MQTT", "Menghubungkan ke %s:%d ...", MQTT_HOST, MQTT_PORT);
+  logInfo("MQTT", "Menghubungkan ke %s:%d sebagai '%s' ...", MQTT_HOST, MQTT_PORT, MQTT_USER);
 
-  if (_mqtt.connect(MQTT_CLIENT_ID))
+  // BARU - kirim username & password, bukan lagi connect() polos.
+  // Mosquitto di VPS akan menolak koneksi tanpa ini (kode state 5).
+  if (_mqtt.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS))
   {
     _state = MQTT_STATE_CONNECTED;
     logInfo("MQTT", "Terhubung ke broker.");
@@ -21,7 +23,7 @@ void MqttManager::tryConnect()
   else
   {
     _state = MQTT_STATE_DISCONNECTED;
-    logWarn("MQTT", "Gagal connect, kode state: %d. Coba lagi dalam %lu ms",
+    logWarn("MQTT", "Gagal connect, kode state: %d (cek lagi MQTT_USER/MQTT_PASS kalau kodenya 5 = tidak diotorisasi). Coba lagi dalam %lu ms",
             _mqtt.state(), MQTT_RETRY_INTERVAL_MS);
   }
   _lastAttemptAt = millis();

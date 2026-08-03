@@ -16,7 +16,12 @@
     SensorWind.*         -> anemometer (kecepatan angin)
     SensorFloatSwitch.*  -> saklar pelampung (level air kritis)
     SensorGPS.*          -> lokasi titik pemantauan
-    SensorAnalog.*       -> pembacaan tegangan baterai (voltage divider)
+    SensorAnalog.*       -> [tidak dipakai lagi] voltage divider baterai, digantikan SensorINA226
+    SensorINA226.*       -> tegangan baterai (I2C)
+    MosfetSwitch.*       -> saklar ON/OFF generik utk modul IRF520 (Buzzer & Flash)
+    EspCamTrigger.*      -> trigger ESP32-CAM ambil gambar via UART2
+    FuzzyFloodStatus.*   -> logika fuzzy Mamdani utk status Normal/Siaga/Bahaya
+                            (SATU-SATUNYA sumber status - lihat FUZZY_LOGIC_README.md)
 
   Prinsip ketersediaan tinggi (high availability) yang dipakai:
    1. TIDAK ADA blocking while(true)/delay(lama) di loop utama. Kalau
@@ -48,21 +53,39 @@
 #include "SensorGPS.h"
 #include "SensorAnalog.h"
 #include "SensorTest.h"
+#include "DisplayOLED.h"
+#include "SensorINA226.h"
+#include "MosfetSwitch.h"
+#include "EspCamTrigger.h"
+#include "FuzzyFloodStatus.h"
 
 WiFiManager wifiManager;
 MqttManager mqttManager;
+DisplayOLED displayOLED;
 SensorRain sensorRain;
 SensorLidar sensorLidar;
 SensorAHT20 sensorAHT20;
 SensorWind sensorWind;
 SensorFloatSwitch sensorFloat;
 SensorGPS sensorGPS;
-SensorAnalog sensorBaterai(PIN_POT_BATERAI, BATERAI_RENTANG_V, BATERAI_MIN_V);
+SensorINA226 sensorINA226;
+EspCamTrigger camTrigger;
+MosfetSwitch buzzerSwitch(PIN_BUZZER, BUZZER_ACTIVE_HIGH);
+MosfetSwitch flashSwitch(PIN_FLASH, FLASH_ACTIVE_HIGH);
+FuzzyFloodStatus fuzzyFlood;
+
 
 RiverData data;
 
 unsigned long lastStatusPrint = 0;
 unsigned long lastKirimMqtt = 0;
+bool alarmTmaSebelumnya = false;  // utk deteksi transisi naik (edge) alarm
+
+// Cache hasil fuzzy TERKINI - dihitung SEKALI per loop() di updateAlarmOutputs(),
+// dibaca ulang oleh ambilDataSensor() (BUKAN dihitung ulang) supaya tidak ada
+// duplikasi logika status di lebih dari satu tempat.
+float skorFuzzyTerkini = 0.0f;
+StatusBanjir statusFuzzyTerkini = StatusBanjir::NORMAL;
 
 // ------------------------------------------------------------
 // Ambil data langsung dari semua sensor asli ke dalam satu snapshot.
@@ -77,7 +100,13 @@ void ambilDataSensor() {
   }
 
   if (sensorLidar.isHealthy()) {
-    data.tma_cm = TFLUNA_TINGGI_PEMASANGAN_CM - sensorLidar.getDistanceCM();
+    // DUA perhitungan terpisah dari 1 pembacaan sensor, referensi beda:
+    data.tma_cm      = TFLUNA_TINGGI_PEMASANGAN_CM - sensorLidar.getDistanceCM(); // legacy, kompatibilitas dashboard - TIDAK dipakai fuzzy
+    data.freeboard_m = (JARAK_SENSOR_KE_TEBING_KRITIS_CM - sensorLidar.getDistanceCM()) / 100.0f; // dipakai fuzzy/status
+  }
+
+  if (sensorINA226.isHealthy()) {
+    data.baterai_v = sensorINA226.getBusVoltageV();
   }
 
   data.angin_kmph = sensorWind.getSpeedKMH();
@@ -85,13 +114,73 @@ void ambilDataSensor() {
   data.hujan_intensitas_mmh = sensorRain.getIntensityMMh();
   data.hujan_kategori = sensorRain.getCategory();
   data.levelKritis = sensorFloat.isWaterHigh();
-  data.baterai_v = sensorBaterai.read();
+
+  // Status fuzzy - SATU-SATUNYA sumber (dihitung di updateAlarmOutputs(),
+  // di sini cuma DIBACA dari cache, tidak dihitung ulang).
+  data.statusSkor = skorFuzzyTerkini;
+  data.statusLabel = FuzzyFloodStatus::labelKeString(statusFuzzyTerkini);
 
   data.gpsFix = sensorGPS.hasFix();
   if (data.gpsFix) {
     data.gpsLat = sensorGPS.getLat();
     data.gpsLng = sensorGPS.getLng();
   }
+}
+
+// ------------------------------------------------------------
+// Sinkronkan output alarm & picu kamera berdasarkan LOGIKA FUZZY (Mamdani)
+// dari 2 sensor kontinu: TMA (freeboard) & Curah Hujan. Ini SATU-SATUNYA
+// tempat status Normal/Siaga/Bahaya dihitung - lihat FuzzyFloodStatus.h/.cpp
+// dan FUZZY_LOGIC_README.md untuk penjelasan lengkap & sumber tiap parameter.
+//
+//   BAHAYA = Float Switch AKTIF  ATAU  status fuzzy == BAHAYA
+//            -> BUZZER menyala (HANYA di kondisi ini)
+//   SIAGA  = status fuzzy == SIAGA (atau BAHAYA)
+//            -> bersama BAHAYA, FLASH & KAMERA menyala (kedua kondisi)
+//
+// Dipanggil TIAP loop() - langsung pakai getter sensor real-time (BUKAN
+// data.freeboard_m/data.levelKritis yang cuma di-refresh tiap
+// ambilDataSensor() dipanggil, bisa telat ~1 detik).
+// ------------------------------------------------------------
+void updateAlarmOutputs() {
+  bool airTinggi = sensorFloat.isWaterHigh(); // Float Switch - crisp override, TETAP di luar fuzzy
+
+  float freeboardM = (JARAK_SENSOR_KE_TEBING_KRITIS_CM - sensorLidar.getDistanceCM()) / 100.0f;
+  bool  lidarOk     = sensorLidar.isHealthy();
+
+  if (lidarOk) {
+    skorFuzzyTerkini   = fuzzyFlood.hitungSkor(freeboardM, sensorRain.getIntensityMMh());
+    statusFuzzyTerkini = FuzzyFloodStatus::skorKeLabel(skorFuzzyTerkini);
+  }
+  // Kalau !lidarOk, skorFuzzyTerkini/statusFuzzyTerkini SENGAJA dibiarkan
+  // nilai lama - konsisten dgn filosofi "jangan timpa dgn 0 saat sensor
+  // unhealthy" yang dipakai di seluruh project.
+
+  bool siagaDariFuzzy  = lidarOk && (statusFuzzyTerkini == StatusBanjir::SIAGA || statusFuzzyTerkini == StatusBanjir::BAHAYA);
+  bool bahayaDariFuzzy = lidarOk && (statusFuzzyTerkini == StatusBanjir::BAHAYA);
+
+  bool bahaya          = airTinggi || bahayaDariFuzzy; // BUZZER: HANYA kondisi ini
+  bool siagaAtauBahaya = siagaDariFuzzy || bahaya;     // FLASH & KAMERA: kedua kondisi ini
+
+  buzzerSwitch.set(bahaya);
+  flashSwitch.set(siagaAtauBahaya);
+
+  // Deteksi transisi naik (baru saja MASUK status siaga/bahaya) - picu
+  // SEKALI saja per kejadian, bukan tiap loop() selama status masih aktif.
+  if (siagaAtauBahaya && !alarmTmaSebelumnya) {
+    logWarn("SYSTEM", "!!! STATUS %s (skor fuzzy=%.1f, freeboard=%.2fm, hujan=%.1fmm/jam%s) - flash menyala, memicu ESP32-CAM !!!",
+            bahaya ? "BAHAYA" : "SIAGA", skorFuzzyTerkini, freeboardM, sensorRain.getIntensityMMh(),
+            airTinggi ? ", FloatSwitch-AKTIF" : "");
+    // Flash SUDAH dinyalakan di atas (flashSwitch.set(true)) SEBELUM baris
+    // ini - camTrigger.requestCapture() hanya menandai permintaan, lalu
+    // camTrigger.update() (dipanggil tiap loop()) yang benar-benar mengirim
+    // perintah setelah CAM_FLASH_WARMUP_MS berlalu (non-blocking).
+    camTrigger.requestCapture();
+  } else if (!siagaAtauBahaya && alarmTmaSebelumnya) {
+    logInfo("SYSTEM", "Status kembali NORMAL.");
+  }
+
+  alarmTmaSebelumnya = siagaAtauBahaya;
 }
 
 // ------------------------------------------------------------
@@ -115,9 +204,9 @@ void printSystemStatus() {
   logInfo("SYSTEM", "Rain Gauge  : %s | %.2f mm/jam | %s | total=%.1f mm",
           sensorRain.isHealthy() ? "OK" : "ERROR",
           sensorRain.getIntensityMMh(), sensorRain.getCategory().c_str(), sensorRain.getTotalMM());
-  logInfo("SYSTEM", "TF-Luna     : %s | jarak=%d cm, tma=%.1f cm, kekuatan sinyal=%d",
+  logInfo("SYSTEM", "TF-Luna     : %s | jarak=%d cm, tma=%.1f cm (legacy), freeboard=%.2f m, sinyal=%d",
           sensorLidar.isHealthy() ? "OK" : "ERROR",
-          sensorLidar.getDistanceCM(), data.tma_cm, sensorLidar.getStrength());
+          sensorLidar.getDistanceCM(), data.tma_cm, data.freeboard_m, sensorLidar.getStrength());
   logInfo("SYSTEM", "AHT20       : %s | %.2f C, %.2f %%RH",
           sensorAHT20.isHealthy() ? "OK" : "ERROR",
           sensorAHT20.getTemperatureC(), sensorAHT20.getHumidityRH());
@@ -131,6 +220,10 @@ void printSystemStatus() {
           sensorGPS.isHealthy() ? "OK" : "ERROR (tidak ada data masuk)",
           sensorGPS.hasFix() ? "ya" : "belum", (unsigned long)sensorGPS.getSatellites());
   logInfo("SYSTEM", "Baterai     : %.2f V", data.baterai_v);
+  logInfo("SYSTEM", "Status Fuzzy: %s (skor=%.1f) | Buzzer: %s | Flash: %s",
+          data.statusLabel.c_str(), data.statusSkor,
+          buzzerSwitch.isOn() ? "MENYALA" : "mati",
+          flashSwitch.isOn() ? "MENYALA" : "mati");
   logInfo("SYSTEM", "========================================================");
 }
 
@@ -139,29 +232,30 @@ void setup() {
   delay(300);
 
   logInfo("SYSTEM", "=== River Monitoring System - Booting ===");
+  displayOLED.begin();  // aman dipanggil duluan - tidak bentrok dgn sensor I2C lain (alamat beda)
 
-  #if TEST_MODE == 1
-    logInfo("SYSTEM", "TEST_MODE=1 -> menguji sensor '%s' saja, WiFi/MQTT tidak dipakai", TEST_SENSOR_NAME);
-    while (true) {
-      testSensor(TEST_SENSOR_NAME);
-      delay(TEST_MODE_INTERVAL_MS);
-    }
-  #elif TEST_MODE == 2
-    logInfo("SYSTEM", "TEST_MODE=2 -> menguji semua sensor, WiFi/MQTT tidak dipakai");
-    analogSetAttenuation(ADC_11db);
-    sensorRain.begin();
-    sensorLidar.begin();
-    sensorAHT20.begin();
-    sensorWind.begin();
-    sensorFloat.begin();
-    sensorGPS.begin();
-    sensorBaterai.begin();
+#if TEST_MODE == 1
+  logInfo("SYSTEM", "TEST_MODE=1 -> menguji sensor '%s' saja, WiFi/MQTT tidak dipakai", TEST_SENSOR_NAME);
+  while (true) {
+    testSensor(TEST_SENSOR_NAME);
+    delay(TEST_MODE_INTERVAL_MS);
+  }
+#elif TEST_MODE == 2
+  logInfo("SYSTEM", "TEST_MODE=2 -> menguji semua sensor, WiFi/MQTT tidak dipakai");
+  analogSetAttenuation(ADC_11db);
+  sensorRain.begin();
+  sensorLidar.begin();
+  sensorAHT20.begin();
+  sensorWind.begin();
+  sensorFloat.begin();
+  sensorGPS.begin();
+  sensorINA226.begin();
 
-    while (true) {
-      testAllSensors();
-      delay(TEST_MODE_INTERVAL_MS);
-    }
-  #endif
+  while (true) {
+    testAllSensors();
+    delay(TEST_MODE_INTERVAL_MS);
+  }
+#endif
 
 
   wifiManager.begin();
@@ -175,7 +269,10 @@ void setup() {
   sensorWind.begin();
   sensorFloat.begin();
   sensorGPS.begin();
-  sensorBaterai.begin();
+  sensorINA226.begin();
+  buzzerSwitch.begin();
+  flashSwitch.begin();
+  camTrigger.begin();
 
   lastStatusPrint = millis();
   lastKirimMqtt = millis();
@@ -196,6 +293,9 @@ void loop() {
   sensorWind.update();
   sensorFloat.update();
   sensorGPS.update();
+  updateAlarmOutputs();
+  sensorINA226.update();
+  camTrigger.update();
 
   // Kirim data ke MQTT tiap INTERVAL_KIRIM_MQTT_MS, langsung dari sensor asli.
   // Kalau MQTT sedang terputus, publish() di dalamnya hanya akan
@@ -204,6 +304,10 @@ void loop() {
     lastKirimMqtt = millis();
     kirimDataKeServer();
   }
+
+  // Tampilan OLED - non-blocking, throttled sendiri lewat OLED_UPDATE_INTERVAL_MS.
+  // Kontennya (DEBUG/NORMAL) tergantung OLED_MODE di Config.h.
+  displayOLED.update(data, wifiManager.isConnected(), mqttManager.isConnected());
 
   // Heartbeat status berkala, berguna untuk commissioning & debugging lapangan
   if (millis() - lastStatusPrint >= STATUS_PRINT_INTERVAL_MS) {
